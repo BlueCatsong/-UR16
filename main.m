@@ -17,6 +17,40 @@ close all; clc; clear;
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%                       USER-DEFINED INPUTS                           %%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%% --- [新增] 硬件连接初始化 ---
+
+% 1. 连接 RealSense 相机
+% 确保已安装 RealSense SDK 并且 MATLAB 能找到 realsense.* 类
+pipe = realsense.pipeline();
+cfg = realsense.config();
+cfg.enable_stream(realsense.stream.depth, 640, 480, realsense.format.z16, 30);
+cfg.enable_stream(realsense.stream.color, 640, 480, realsense.format.rgb8, 30);
+profile = pipe.start(cfg);
+
+% 获取深度缩放因子 (Depth Scale)
+depth_sensor = profile.get_device().first('depth_sensor');
+depth_scale = depth_sensor.get_depth_scale();
+
+% 2. 连接 UR16e 机械臂 (使用 TCP/IP)
+% 替换为你的机械臂实际 IP 地址
+robot_ip = '192.168.1.100'; 
+robot_port = 30003; % 30003 是实时数据端口，30002 也可以用于发送指令
+try
+    robot_socket = tcpclient(robot_ip, robot_port);
+    fprintf('成功连接到机械臂: %s\n', robot_ip);
+catch
+    error('无法连接到机械臂，请检查 IP 和网络连接。');
+end
+
+% 手眼标定矩阵 (非常重要！)
+% 需要你提前标定：从“法兰中心(Tool)”到“相机中心(Camera)”的变换矩阵
+% 假设相机安装在法兰上，这里需要填入实际值
+T_flange_camera = eye(4); 
+% 例如：T_flange_camera(1:3,4) = [0.05; 0; 0.1]; % 相机相对于法兰的偏移
+
+
+
+
 
 % Input and output subfolders
 inputDir = 'inputs';
@@ -375,8 +409,59 @@ while 1
     drawnow;
     
     % Simulate acquisition of point cloud from sensor
-    [newData,intersectedFaces] = F_syntetic_receiveCloudFromRGBD(sensor,...
-          sampleTriangulation.Points,sampleTriangulation.ConnectivityList);
+    % [newData,intersectedFaces] = F_syntetic_receiveCloudFromRGBD(sensor,...
+    %       sampleTriangulation.Points,sampleTriangulation.ConnectivityList);
+
+
+%% --- [修改] 驱动真实硬件采集 ---
+
+% 1. 计算机械臂目标位姿
+% sensor.position/rotationMatrix 是优化算出的“相机”目标位姿(World系)
+% 我们需要将其转换为“法兰”的目标位姿，并转换为 UR 识别的格式
+target_camera_pose = eye(4);
+target_camera_pose(1:3, 1:3) = sensor.rotationMatrix;
+target_camera_pose(1:3, 4) = sensor.position' / 1000; % 毫米转米 (UR单位是米)
+
+% 计算法兰位姿: T_base_flange = T_base_camera * inv(T_flange_camera)
+target_flange_pose = target_camera_pose / T_flange_camera; 
+
+% 2. 发送运动指令给 UR 机械臂
+% 这里调用一个自定义函数 (见下文第3部分)
+F_moveRealUR(robot_socket, target_flange_pose);
+
+% 3. 等待机械臂稳定 (简单延时，或通过读取 robot_socket 状态判断是否到位)
+pause(0.5); 
+
+% 4. RealSense 采集真实点云
+% 这里调用一个自定义函数 (见下文第3部分)
+% 注意：真实相机采到的点是在“相机坐标系”下的，需要转到“世界坐标系”
+real_point_cloud_camera_frame = F_getRealSenseData(pipe, depth_scale);
+
+% 5. 将点云转到世界坐标系 (World Frame)
+% 此时机械臂已到达 target_camera_pose
+% P_world = R_world_cam * P_cam + T_world_cam
+% 注意单位：sensor.position 是 mm，RealSense 采集通常是 m，需要统一到 mm
+pts_cam = real_point_cloud_camera_frame(:, 1:3) * 1000; % 米转毫米
+pts_world = (sensor.rotationMatrix * pts_cam')' + sensor.position;
+
+% 构造 newData 格式: [x, y, z, vx, vy, vz, R, G, B]
+% DetectionVector (vx,vy,vz) 是视线方向，即相机光轴 (Z轴) 在世界系的向量
+view_vec_world = sensor.rotationMatrix(:, 3)'; 
+num_pts = size(pts_world, 1);
+detection_vectors = repmat(view_vec_world, num_pts, 1);
+% 计算投影距离 d (参考原仿真代码)
+d_vals = pts_cam(:, 3); % 相机系下的 Z 就是距离
+detection_vectors = detection_vectors .* d_vals; % 原代码似乎乘以了距离
+
+% 组合数据
+% 真实数据颜色通常是 0-255，原代码在 F_saveDsDataAsPLY 里处理了类型
+% 确保 real_point_cloud_camera_frame 包含颜色列 4:6
+colors = real_point_cloud_camera_frame(:, 4:6); 
+
+newData = [pts_world, detection_vectors, colors];
+
+% ------------------------------------------------
+
 
     % Append current sensor to the list of sensors used in previous poses
     allSensors{k} = sensor;
